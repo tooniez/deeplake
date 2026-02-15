@@ -46,6 +46,7 @@ extern "C" {
 #include <icm/json.hpp>
 #include <icm/string_map.hpp>
 #include <nd/none.hpp>
+#include <unordered_set>
 
 #include <algorithm>
 #include <vector>
@@ -287,22 +288,55 @@ void table_storage::load_table_metadata()
                     continue;
                 }
 
+                // Snapshot tables_ keys so we can roll back C++ state on failure
+                std::vector<Oid> tables_before;
+                tables_before.reserve(tables_.size());
+                for (const auto& [oid, _] : tables_) {
+                    tables_before.push_back(oid);
+                }
+
                 MemoryContext saved_context = CurrentMemoryContext;
                 ResourceOwner saved_owner = CurrentResourceOwner;
                 BeginInternalSubTransaction(nullptr);
                 PG_TRY();
                 {
                     set_catalog_only_create(true);
-                    pg::utils::spi_connector connector;
+                    SPI_connect();
                     bool pushed_snapshot = false;
                     if (!ActiveSnapshotSet()) {
                         PushActiveSnapshot(GetTransactionSnapshot());
                         pushed_snapshot = true;
                     }
+                    // Restore the original search_path so unqualified names resolve correctly
+                    std::string saved_search_path;
+                    if (!entry.search_path.empty()) {
+                        const char* current_sp = GetConfigOption("search_path", true, false);
+                        if (current_sp != nullptr) {
+                            saved_search_path = current_sp;
+                        }
+                        StringInfoData sp_sql;
+                        initStringInfo(&sp_sql);
+                        appendStringInfo(&sp_sql,
+                                         "SELECT pg_catalog.set_config('search_path', %s, true)",
+                                         quote_literal_cstr(entry.search_path.c_str()));
+                        SPI_execute(sp_sql.data, true, 0);
+                        pfree(sp_sql.data);
+                    }
                     SPI_execute(entry.ddl_sql.c_str(), false, 0);
+                    // Restore the session's original search_path
+                    if (!entry.search_path.empty()) {
+                        StringInfoData restore_sql;
+                        initStringInfo(&restore_sql);
+                        appendStringInfo(&restore_sql,
+                                         "SELECT pg_catalog.set_config('search_path', %s, true)",
+                                         quote_literal_cstr(saved_search_path.c_str()));
+                        SPI_execute(restore_sql.data, true, 0);
+                        pfree(restore_sql.data);
+                    }
                     if (pushed_snapshot) {
                         PopActiveSnapshot();
                     }
+                    SPI_finish();
                     set_catalog_only_create(false);
                     ReleaseCurrentSubTransaction();
                 }
@@ -310,11 +344,28 @@ void table_storage::load_table_metadata()
                 {
                     set_catalog_only_create(false);
                     MemoryContextSwitchTo(saved_context);
+                    ErrorData* edata = CopyErrorData();
                     CurrentResourceOwner = saved_owner;
                     RollbackAndReleaseCurrentSubTransaction();
                     FlushErrorState();
-                    elog(WARNING, "pg_deeplake: DDL WAL replay failed (seq=%ld, tag=%s): %.200s",
-                         entry.seq, entry.command_tag.c_str(), entry.ddl_sql.c_str());
+
+                    // Remove any tables_ entries added during the failed replay,
+                    // since the subtransaction rollback undid the catalog changes
+                    // but the C++ map entries persist.
+                    std::unordered_set<Oid> before_set(tables_before.begin(), tables_before.end());
+                    for (auto it = tables_.begin(); it != tables_.end(); ) {
+                        if (!before_set.contains(it->first)) {
+                            it = tables_.erase(it);
+                        } else {
+                            ++it;
+                        }
+                    }
+
+                    elog(WARNING, "pg_deeplake: DDL WAL replay failed (seq=%ld, tag=%s): %s (SQL: %.200s)",
+                         entry.seq, entry.command_tag.c_str(),
+                         edata->message ? edata->message : "unknown error",
+                         entry.ddl_sql.c_str());
+                    FreeErrorData(edata);
                 }
                 PG_END_TRY();
             }
@@ -852,7 +903,6 @@ void table_storage::drop_table(const std::string& table_name)
     if (table_exists(table_name)) {
         auto& table_data = get_table_data(table_name);
         auto creds = session_credentials::get_credentials();
-
 
         try {
             table_data.commit(); // Ensure all changes are committed before deletion
